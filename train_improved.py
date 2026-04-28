@@ -134,6 +134,10 @@ def _train_two_stage_small_data(model: YOLO, args, train_args: dict):
     stage1_results = model.train(**stage1_args)
     stage1_last = Path(stage1_results.save_dir) / "weights" / "last.pt"
     stage2_model = YOLO(str(stage1_last)) if stage1_last.exists() else model
+    if stage1_last.exists():
+        # 兼容部分 ultralytics 版本：从 checkpoint 初始化后 overrides 中可能缺失 "model"
+        # 会在 model.train() 内部访问 self.overrides["model"] 时触发 KeyError
+        stage2_model.overrides["model"] = str(stage1_last)
     _inject_wiou(stage2_model)
 
     stage2_args = dict(train_args)
