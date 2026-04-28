@@ -31,6 +31,10 @@ def parse_args():
     p.add_argument("--device",  default="0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--resume",  action="store_true", help="断点续训")
     p.add_argument("--compare", action="store_true", help="同时训练原版做对比实验")
+    p.add_argument("--small-data", action="store_true", help="小数据集模式（推荐 <= 2000 张）")
+    p.add_argument("--freeze-epochs", type=int, default=30, help="第一阶段冻结训练轮数")
+    p.add_argument("--mixup-stage1", type=float, default=0.15, help="第一阶段 MixUp 强度")
+    p.add_argument("--mixup-stage2", type=float, default=0.0, help="第二阶段 MixUp 强度")
     return p.parse_args()
 
 
@@ -47,29 +51,25 @@ def print_env():
     print(f"{'='*55}\n")
 
 
-def _inject_wiou(model: YOLO):
-    """
-    将 YOLOv8 训练器的边框损失替换为 WIoU
-    对应论文损失函数改进部分
-    """
-    wiou = WIoULoss()
+def _patch_bbox_loss_with_wiou(trainer, wiou):
+    """将 trainer 内部 bbox_loss 前向替换为 WIoU。"""
+    if not hasattr(trainer, "compute_loss") or not hasattr(trainer.compute_loss, "bbox_loss"):
+        return False
+
+    bbox_loss = trainer.compute_loss.bbox_loss
 
     def patched_bbox_loss(self, pred_dist, pred_bboxes, anchor_points,
                           target_bboxes, target_scores, target_scores_sum, fg_mask):
         """替换后的 bbox 损失计算，使用 WIoU 代替 CIoU"""
         if fg_mask.sum():
-            # 选取正样本
-            pred_b   = pred_bboxes[fg_mask]
+            pred_b = pred_bboxes[fg_mask]
             target_b = target_bboxes[fg_mask]
-            weight   = target_scores[fg_mask].sum(-1, keepdim=True)
+            weight = target_scores[fg_mask].sum(-1, keepdim=True)
 
-            # ★ WIoU 损失
             iou_loss = wiou(pred_b, target_b)
             box_loss = (iou_loss * weight).sum() / target_scores_sum
 
-            # DFL 损失保持原版不变
-            dfl_loss = self._df_loss(pred_dist[fg_mask],
-                                     target_b) * weight
+            dfl_loss = self._df_loss(pred_dist[fg_mask], target_b) * weight
             dfl_loss = dfl_loss.sum() / target_scores_sum
         else:
             box_loss = pred_bboxes.sum() * 0
@@ -77,19 +77,62 @@ def _inject_wiou(model: YOLO):
 
         return box_loss * self.hyp.box, dfl_loss * self.hyp.dfl
 
-    # 找到 trainer 中的 BboxLoss 实例并替换方法
+    bbox_loss.forward = types.MethodType(patched_bbox_loss, bbox_loss)
+    return True
+
+
+def _inject_wiou(model: YOLO):
+    """
+    将 YOLOv8 训练器的边框损失替换为 WIoU
+    对应论文损失函数改进部分
+    """
+    wiou = WIoULoss()
+
+    def on_train_start(trainer):
+        ok = _patch_bbox_loss_with_wiou(trainer, wiou)
+        print("[✓] WIoU 损失函数注入成功" if ok else "[!] WIoU 注入失败，保持原版 CIoU")
+
     try:
-        trainer = model.trainer
-        if hasattr(trainer, "compute_loss") and \
-           hasattr(trainer.compute_loss, "bbox_loss"):
-            trainer.compute_loss.bbox_loss.forward = types.MethodType(
-                patched_bbox_loss, trainer.compute_loss.bbox_loss
-            )
-            print("[✓] WIoU 损失函数注入成功")
-        else:
-            print("[*] WIoU 将在训练开始后自动注入")
-    except Exception:
-        print("[*] WIoU 将在训练开始后自动注入")
+        model.add_callback("on_train_start", on_train_start)
+        print("[*] WIoU 回调已注册，将在训练开始时注入")
+    except Exception as e:
+        print(f"[!] 无法注册 WIoU 回调: {e}")
+
+
+def _train_two_stage_small_data(model: YOLO, args, train_args: dict):
+    """小数据集两阶段训练：先冻结+强增强，再解冻+弱增强。"""
+    total_epochs = args.epochs
+    stage1_epochs = min(max(args.freeze_epochs, 1), max(total_epochs - 1, 1))
+    stage2_epochs = max(total_epochs - stage1_epochs, 1)
+
+    print("\n[小数据集两阶段训练]")
+    print(f"  Stage1: epochs={stage1_epochs}, freeze=10, mixup={args.mixup_stage1}")
+    print(f"  Stage2: epochs={stage2_epochs}, freeze=0, mixup={args.mixup_stage2}")
+
+    stage1_args = dict(train_args)
+    stage1_args.update({
+        "epochs": stage1_epochs,
+        "freeze": 10,
+        "mixup": args.mixup_stage1,
+        "close_mosaic": 0,
+        "name": "tire_yolov8_real_data_stage1",
+    })
+    model.train(**stage1_args)
+
+    stage1_last = Path("runs/train/tire_yolov8_real_data_stage1/weights/last.pt")
+    stage2_model = YOLO(str(stage1_last)) if stage1_last.exists() else model
+    _inject_wiou(stage2_model)
+
+    stage2_args = dict(train_args)
+    stage2_args.update({
+        "epochs": stage2_epochs,
+        "freeze": 0,
+        "mixup": args.mixup_stage2,
+        "close_mosaic": max(stage2_epochs // 2, 1),
+        "resume": stage1_last.exists(),
+        "name": "tire_yolov8_real_data",
+    })
+    return stage2_model.train(**stage2_args)
 
 
 def train_improved(args):
@@ -140,8 +183,10 @@ def train_improved(args):
     print(f"  ✅ 训练设备   : {train_args['device']}\n")
 
     # ── 注入 WIoU 损失函数 ──
-    # 将模型内部的 bbox_loss 替换为 WIoU
-    pass  # 使用原版CIoU
+    _inject_wiou(model)
+
+    if args.small_data:
+        return _train_two_stage_small_data(model, args, train_args)
 
     results = model.train(**train_args)
     return results
