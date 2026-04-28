@@ -106,24 +106,31 @@ def _inject_wiou(model: YOLO):
     对应论文损失函数改进部分
     """
     wiou = WIoULoss()
-    patched = {"done": False}
+    patched = {"done": False, "attempts": 0}
 
     def try_patch(trainer):
         if patched["done"]:
             return
+        patched["attempts"] += 1
         ok = _patch_bbox_loss_with_wiou(trainer, wiou)
         if ok:
             patched["done"] = True
             print("[✓] WIoU 损失函数注入成功")
-        else:
-            print("[!] WIoU 注入重试中：当前阶段未找到 bbox_loss")
+        elif patched["attempts"] == 1:
+            print("[!] WIoU 暂未注入成功，将在后续训练阶段重试")
 
-    try:
-        model.add_callback("on_train_start", try_patch)
-        model.add_callback("on_train_epoch_start", try_patch)
-        print("[*] WIoU 回调已注册（on_train_start/on_train_epoch_start）")
-    except Exception as e:
-        print(f"[!] 无法注册 WIoU 回调: {e}")
+    callback_events = ("on_train_start", "on_train_epoch_start")
+    registered = []
+    for event in callback_events:
+        try:
+            model.add_callback(event, try_patch)
+            registered.append(event)
+        except Exception:
+            continue
+    if registered:
+        print(f"[*] WIoU 回调已注册（{', '.join(registered)}）")
+    else:
+        print("[!] 无法注册 WIoU 回调：当前 ultralytics 版本不支持相关事件")
 
 
 def _train_two_stage_small_data(model: YOLO, args, train_args: dict):
