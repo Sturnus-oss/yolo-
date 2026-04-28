@@ -17,6 +17,7 @@ import argparse
 import torch
 import types
 from pathlib import Path
+import yaml
 from ultralytics import YOLO
 from model_with_se import build_model, get_train_args
 from wiou_loss import WIoULoss
@@ -35,7 +36,20 @@ def parse_args():
     p.add_argument("--freeze-epochs", type=int, default=30, help="第一阶段冻结训练轮数")
     p.add_argument("--mixup-stage1", type=float, default=0.15, help="第一阶段 MixUp 强度")
     p.add_argument("--mixup-stage2", type=float, default=0.0, help="第二阶段 MixUp 强度")
+    p.add_argument("--num-classes", type=int, default=None, help="类别数，默认从 data.yaml 自动读取")
     return p.parse_args()
+
+
+def _infer_num_classes(data_path: str) -> int:
+    """优先从 data.yaml 读取类别数，失败时回退到 5。"""
+    try:
+        with open(data_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        if isinstance(cfg.get("nc"), int) and cfg["nc"] > 0:
+            return cfg["nc"]
+    except Exception as e:
+        print(f"[!] 读取数据集类别数失败，将使用默认值 5: {e}")
+    return 5
 
 
 def print_env():
@@ -117,9 +131,8 @@ def _train_two_stage_small_data(model: YOLO, args, train_args: dict):
         "close_mosaic": 0,
         "name": "tire_yolov8_real_data_stage1",
     })
-    model.train(**stage1_args)
-
-    stage1_last = Path("runs/train/tire_yolov8_real_data_stage1/weights/last.pt")
+    stage1_results = model.train(**stage1_args)
+    stage1_last = Path(stage1_results.save_dir) / "weights" / "last.pt"
     stage2_model = YOLO(str(stage1_last)) if stage1_last.exists() else model
     _inject_wiou(stage2_model)
 
@@ -129,7 +142,7 @@ def _train_two_stage_small_data(model: YOLO, args, train_args: dict):
         "freeze": 0,
         "mixup": args.mixup_stage2,
         "close_mosaic": max(stage2_epochs // 2, 1),
-        "resume": stage1_last.exists(),
+        "resume": False,
         "name": "tire_yolov8_real_data",
     })
     return stage2_model.train(**stage2_args)
@@ -160,7 +173,7 @@ def train_improved(args):
     # 构建改进模型（注入 SE）
     model = build_model(
         weights     = "yolov8n.pt",
-        num_classes = 5,
+        num_classes = args.num_classes if args.num_classes else _infer_num_classes(args.data),
         reduction   = 16,
         device      = args.device,
     )
